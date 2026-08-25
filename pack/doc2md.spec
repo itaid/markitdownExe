@@ -35,8 +35,8 @@ for package in [
 icon_path = os.path.join(HERE, "icon.ico")
 
 a = Analysis(
-    ["pack/entry_gui.py"],
-    pathex=["src"],
+    ["entry_gui.py"],                     # PyInstaller 会把 CWD 切到 spec 所在目录(pack/)
+    pathex=[os.path.join(HERE, "..", "src")],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports + ["doc2md_tool", "doc2md_tool.gui",
