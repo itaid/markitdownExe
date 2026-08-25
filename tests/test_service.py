@@ -228,3 +228,22 @@ def test_docx_small_icon_dropped(tmp_path: Path):
     assert "base64" not in md
     assert "![图片" not in md
     assert not (out / "点_img").exists() or not (out / "点_img").iterdir()
+
+def test_pptx_omits_images_when_no_media(tmp_path: Path):
+    """pptx 无内嵌图片：正常吐出全文字，img 张数 0，不报错"""
+    from pptx import Presentation
+    prs = Presentation()
+    s1 = prs.slides.add_slide(prs.slide_layouts[1])
+    s1.shapes.title.text = "纯文字页"
+    body = s1.shapes.add_textbox(0, 5, 9144000, 685800)
+    body.text_frame.text = "这是正常的中文正文内容，长度足够，不会触发短文本警告分支。"
+    src = tmp_path / "无图.pptx"
+    prs.save(src)
+    out = tmp_path / "out"
+    r = convert_file(src, ConvertOptions(output_dir=out))
+    assert r.status == "ok", r.message
+    assert r.img_count == 0
+    md = (out / "无图.md").read_text(encoding="utf-8")
+    assert "纯文字页" in md
+    assert "![图片" not in md
+    assert not (out / "无图_img").exists()
