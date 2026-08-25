@@ -80,17 +80,18 @@ jobs:
       - name: 打包
         shell: pwsh
         run: pyinstaller pack/doc2md.spec --noconfirm
+      - name: README 放包内
+        shell: pwsh
+        run: Copy-Item README.md dist\README.md
       - name: 压缩成品
         shell: pwsh
         run: |
-          Get-ChildItem dist\*
-          Compress-Archive -Path dist\doc2md.exe -DestinationPath "dist\doc2md_${{ needs.version.outputs.version }}_win64.zip"
+          Compress-Archive -Path dist\doc2md.exe, dist\README.md -DestinationPath "build\doc2md_${{ needs.version.outputs.version }}_win64.zip"
       - name: 上传产物
         uses: actions/upload-artifact@v5
         with:
-          name: doc2md_${{ needs.version.outputs.version }}_win64
-          path: dist/doc2md_${{ needs.version.outputs.version }}_win64.zip
+          # 命名不带 _zip 后缀 → 二次下载/解压不再嵌套
+          name: doc2md-${{ needs.version.outputs.version }}-win64
+          path: build/doc2md_${{ needs.version.outputs.version }}_win64.zip
           if-no-files-found: error
           retention-days: 90
-          # 给拉引用保护用的密钥名（在仓库 Settings → Secrets 配置 ACTIONS_ARTIFACTS 后可取消注释）
-          # include-hidden-files: true
