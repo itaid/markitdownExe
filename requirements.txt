@@ -14,3 +14,7 @@ PySide6>=6.6,<7
 
 # 后处理
 lxml>=5.0
+
+# 测试（构造 docx/pptx 夹具）
+python-docx>=1.1
+python-pptx>=0.6

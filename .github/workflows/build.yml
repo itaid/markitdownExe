@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: |
-          python -m pip install -e ".[gui,ocr]" pytest
+          python -m pip install -e ".[gui,ocr]" pytest python-docx python-pptx
           pytest -q
 
   # 版本号优先级: 触发 tag > 手动输入 > latest
