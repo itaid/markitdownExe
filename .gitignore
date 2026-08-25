@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+
+# PyInstaller
+*.spec.bak
+
+# 测试/临时
+.pytest_cache/
+output/
+转换报告.csv
+
+# 系统
+.DS_Store
+*.log
