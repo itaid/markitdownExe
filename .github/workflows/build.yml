@@ -75,14 +75,16 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[gui,ocr]" pyinstaller
+          # PyInstaller 会清除 __editable__ 查找器，必须常规安装而非 -e
+          python -m pip install ".[gui,ocr]" pyinstaller
       - name: 打包
         shell: pwsh
         run: pyinstaller pack/doc2md.spec --noconfirm
       - name: 压缩成品
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/doc2md -DestinationPath "dist/doc2md_${{ needs.version.outputs.version }}_win64.zip"
+          Get-ChildItem dist\*
+          Compress-Archive -Path dist\doc2md.exe -DestinationPath "dist\doc2md_${{ needs.version.outputs.version }}_win64.zip"
       - name: 上传产物
         uses: actions/upload-artifact@v5
         with:

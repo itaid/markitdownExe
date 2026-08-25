@@ -42,7 +42,7 @@ a = Analysis(
     hiddenimports=hiddenimports + ["doc2md_tool", "doc2md_tool.gui",
                                    "doc2md_tool.service", "doc2md_tool.ocr"],
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "torch"],   # 精简体积
+    excludes=["tkinter", "matplotlib", "torch", "pandas.tests", "pandas._testing"],   # 精简体积
     noarchive=False,
 )
 
