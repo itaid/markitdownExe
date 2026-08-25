@@ -3,6 +3,23 @@ from pathlib import Path
 
 import pytest
 
+
+def _make_test_image(path: Path, label: str):
+    """生成一张 > 4KB、含可 OCR 文字的测试图（条纹提供熵以撑大小）"""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", (820, 400), "white")
+    d = ImageDraw.Draw(im)
+    # 浅灰细条纹 → 提高 PNG 熵，撑过 4KB 阈值，且不影响红框内文字识别
+    for y in range(0, 400, 6):
+        d.line([(0, y), (240, y)], fill=(200, 200, 200), width=1)
+    d.rectangle([0, 0, 819, 46], fill="black")
+    d.text((16, 56), "Quarter report", fill="black")
+    d.text((16, 96), f"Label {label}", fill="black")
+    d.text((16, 136), "Q1=100 Q2=200 Q3=300", fill="black")
+    d.text((16, 176), "Total 600 units", fill="black")
+    im.save(path, optimize=False)
+
+
 from doc2md_tool.service import (
     ConvertOptions,
     collect_files,
@@ -90,7 +107,7 @@ def test_convert_report(tmp_path: Path):
     write_report([r], out / "report.csv")
     with (out / "report.csv").open(encoding="utf-8-sig") as fh:
         rows = list(csv.reader(fh))
-    assert rows[0] == ["状态", "源文件", "输出文件", "字数", "OCR", "耗时(ms)", "备注"]
+    assert rows[0] == ["状态", "源文件", "输出文件", "字数", "OCR", "图片", "耗时(ms)", "备注"]
     assert rows[1][1] == "a.md"
 
 
@@ -129,3 +146,85 @@ def test_ocr_graceful_when_unavailable(tmp_path: Path, monkeypatch):
     r = svc.convert_file(src, svc.ConvertOptions(output_dir=tmp_path / "out", enable_ocr=True))
     assert r.status in ("warning", "error")
     assert r.message
+
+
+def test_docx_embedded_image_extracted(tmp_path: Path):
+    """docx 内嵌图片：base64 不被写入 md，图片落盘，OCR 内联（若有引擎）"""
+    from docx import Document
+    from docx.shared import Inches
+    img_p = tmp_path / "chart.png"
+    _make_test_image(img_p, "ONE")
+
+    src = tmp_path / "含图.docx"
+    doc = Document()
+    doc.add_heading("汇报", 0)
+    doc.add_paragraph("数据见下图：")
+    doc.add_picture(str(img_p), width=Inches(4))
+    doc.save(src)
+
+    out = tmp_path / "out"
+    r = convert_file(src, ConvertOptions(output_dir=out))
+    assert r.status == "ok", r.message
+    assert r.img_count >= 1
+    md = (out / "含图.md").read_text(encoding="utf-8")
+    assert "base64" not in md, "base64 残留在 md 中"
+    assert "![图片1](" in md
+    from doc2md_tool import ocr as _ocr
+    if _ocr.ocr_available():
+        assert "OCR 内容" in md
+    imgs = list((out / "含图_img").glob("*"))
+    assert len(imgs) >= 1
+
+
+def test_pptx_embedded_image_extracted(tmp_path: Path):
+    """pptx 内嵌图片：从 slide 的 rels 抽出，插到对应页，OCR 内联（若有引擎）"""
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    img_p = tmp_path / "pic.png"
+    _make_test_image(img_p, "TWO")
+
+    prs = Presentation()
+    s1 = prs.slides.add_slide(prs.slide_layouts[1])
+    s1.shapes.title.text = "封面页"
+    s2 = prs.slides.add_slide(prs.slide_layouts[5])
+    s2.shapes.title.text = "数据页"
+    s2.shapes.add_picture(str(img_p), Inches(1), Inches(1), width=Inches(4))
+    s3 = prs.slides.add_slide(prs.slide_layouts[1])
+    s3.shapes.title.text = "结束页"
+    src = tmp_path / "演示.pptx"
+    prs.save(src)
+
+    out = tmp_path / "out"
+    r = convert_file(src, ConvertOptions(output_dir=out))
+    assert r.status == "ok", r.message
+    assert r.img_count >= 1
+    content = (out / "演示.md").read_text(encoding="utf-8")
+    assert "![图片1](演示_img/" in content
+    assert (out / "演示_img").is_dir() and any((out / "演示_img").glob("s*_*"))
+    from doc2md_tool import ocr as _ocr
+    if _ocr.ocr_available():
+        assert "OCR 内容" in content
+    assert "base64" not in content
+
+
+def test_docx_small_icon_dropped(tmp_path: Path):
+    """小于 4KB 的装饰图/图标不进入 md"""
+    from docx import Document
+    from docx.shared import Inches
+
+    from PIL import Image
+    Image.new("RGB", (20, 20), "red").save(str(tmp_path / "dot.png"))
+    src = tmp_path / "点.docx"
+    doc = Document()
+    doc.add_heading("A", 0)
+    for _ in range(5):
+        doc.add_paragraph("正文文字内容，足够长度避免短文本警告分支。")
+    doc.add_picture(str(tmp_path / "dot.png"), width=Inches(0.2))
+    doc.save(src)
+    out = tmp_path / "out"
+    r = convert_file(src, ConvertOptions(output_dir=out))
+    md = (out / "点.md").read_text(encoding="utf-8")
+    assert "base64" not in md
+    assert "![图片" not in md
+    assert not (out / "点_img").exists() or not (out / "点_img").iterdir()

@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import base64
+import io
+import posixpath
 import re as _re
 import re
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,6 +29,15 @@ SUPPORTED_EXTENSIONS = [
 
 # 输出 md 内容低于该字数时提示"内容过少"
 WARN_MIN_CHARS = 50
+
+# 内嵌图片处理（docx 的 mammoth 输出 base64 data URI；pptx 的图片被直接丢弃）
+_DATA_URI_RE = re.compile(r"!\[[^\]]*\]\(data:image/([a-zA-Z0-9+-]+);base64,([A-Za-z0-9+/=]+)\)")
+_EXT_BY_MIME = {"png": ".png", "jpeg": ".jpg", "jpg": ".jpg", "webp": ".webp", "gif": ".gif", "bmp": ".bmp"}
+_MIN_IMAGE_BYTES = 4096        # 低于此视为图标/表情，丢弃
+_MAX_OCR_IMAGES = 30           # 单文件 OCR 图片数量上限，超出的只落盘不识别
+_SLIDE_MARKER = re.compile(r"<!-- Slide number: (\d+) -->")
+
+IMG_DIR_HOLDER: dict = {}      # 当前文档的图片目录（_image_block 使用）
 
 # 需人工确认的文件（扫描件/图片/音频）
 NEEDS_REVIEW_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".wav", ".mp3", ".m4a"}
@@ -66,6 +79,7 @@ class FileResult:
     char_count: int = 0
     elapsed_ms: int = 0
     ocr_used: bool = False
+    img_count: int = 0
 
 
 @dataclass
@@ -145,6 +159,55 @@ def _clean_md(text: str) -> str:
     return text.strip()
 
 
+def _soft_ocr_image(data: bytes, ext: str) -> str | None:
+    """对图片字节做 OCR；图太小/无引擎/异常 → None（不阻断主流程）"""
+    import tempfile
+
+    suffix = ext if ext.startswith(".") else "." + ext
+    tf = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        tf.write(data)
+        tf.close()
+    except OSError:
+        tf.close()
+        Path(tf.name).unlink(missing_ok=True)
+        return None
+    try:
+        try:
+            from PIL import Image
+
+            with Image.open(tf.name) as im:
+                if im.width < 150 or im.height < 60:  # 小到识别不了
+                    return None
+        except Exception:  # noqa: BLE001
+            pass
+        from . import ocr as ocr_mod
+
+        lines = ocr_mod.ocr_image(tf.name)
+        if not lines:
+            return None
+        return ocr_mod.lines_to_markdown(lines) or None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        Path(tf.name).unlink(missing_ok=True)
+
+
+def _image_block(data: bytes, name: str, rel_dir: str, options: ConvertOptions, counter: list) -> str | None:
+    counter[0] += 1
+    img_dir = Path(IMG_DIR_HOLDER["dir"])
+    img_dir.mkdir(parents=True, exist_ok=True)
+    (img_dir / name).write_bytes(data)
+    block = f"![图片{counter[0]}]({rel_dir}/{name})"
+    ocr_md = None
+    if options.enable_ocr and counter[0] <= _MAX_OCR_IMAGES:
+        ocr_md = _soft_ocr_image(data, name)
+    if ocr_md:
+        quoted = "\n".join("> " + ln for ln in ocr_md.splitlines() if ln.strip())
+        block += f"\n\n> 图片{counter[0]} OCR 内容\n{quoted}"
+    return block
+
+
 def _has_meaningful_text(md_body: str) -> bool:
     """判断章节内容是否有实际文本（过滤纯 HTML 注释、分隔线等残留）"""
     import re as _re
@@ -210,6 +273,20 @@ def convert_file(
             result.elapsed_ms = int((time.time() - start) * 1000)
             return result
 
+    # 输出目录
+    out_dir = options.output_dir or (src.parent / "output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = normalize_filename(src.stem)
+    use_split = (options.split_at_heading_level > 0
+                 and src.suffix.lower() not in NEEDS_REVIEW_EXT)
+
+    # 内嵌图片抽取（docx/pptx）：消掉 base64 大段，落盘真实文件 + OCR 内联
+    if src.suffix.lower() in (".docx", ".pptx", ".ppt") and text.strip():
+        text, n_imgs = _process_embedded_images(
+            text, src, out_dir / stem, out_dir, stem, use_split, options)
+        result.img_count = n_imgs
+        result.char_count = len(text)
+
     # 扫描件/图片/扫描版 PDF → OCR 兜底（解析出的正文过短时触发）
     ocr_targets = IMAGE_OR_SCAN_EXT | {".pdf"}
     if options.enable_ocr and src.suffix.lower() in ocr_targets:
@@ -242,13 +319,7 @@ def convert_file(
         result.elapsed_ms = int((time.time() - start) * 1000)
         return result
 
-    # 输出目录
-    out_dir = options.output_dir or (src.parent / "output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = normalize_filename(src.stem)
-
-    if (options.split_at_heading_level > 0 and result.src.suffix.lower() not in NEEDS_REVIEW_EXT
-            and not result.ocr_used):
+    if use_split and not result.ocr_used:
         # 按章节切分为多个 md
         sec_dir = out_dir / stem
         sec_dir.mkdir(parents=True, exist_ok=True)
@@ -269,8 +340,8 @@ def convert_file(
         dst.write_text(_clean_md(text) + "\n", encoding="utf-8")
         result.dst = [dst]
 
-    # 状态判定
-    if result.char_count < WARN_MIN_CHARS:
+    # 状态判定（图片已 OCR 内联时不计入短文本警告）
+    if result.char_count < WARN_MIN_CHARS and result.img_count == 0:
         result.status = "warning"
         result.message = f"内容仅 {result.char_count} 字，请人工确认（可能为扫描件/图片）"
     elif src.suffix.lower() in NEEDS_REVIEW_EXT:
@@ -282,7 +353,10 @@ def convert_file(
             result.message = "图片/音频仅提取到元数据（未启用/失败 OCR）"
     else:
         result.status = "ok"
-        result.message = f"输出 {len(result.dst)} 个文件" if len(result.dst) > 1 else "转换成功"
+        msg = f"输出 {len(result.dst)} 个文件" if len(result.dst) > 1 else "转换成功"
+        if result.img_count:
+            msg += f"，提取 {result.img_count} 张图片"
+        result.message = msg
 
     result.elapsed_ms = int((time.time() - start) * 1000)
     return result
@@ -316,7 +390,7 @@ def write_report(results: list[FileResult], report_path: Path) -> None:
 
     with report_path.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["状态", "源文件", "输出文件", "字数", "OCR", "耗时(ms)", "备注"])
+        w.writerow(["状态", "源文件", "输出文件", "字数", "OCR", "图片", "耗时(ms)", "备注"])
         for r in results:
             w.writerow([
                 r.status,
@@ -324,6 +398,187 @@ def write_report(results: list[FileResult], report_path: Path) -> None:
                 "; ".join(p.name for p in r.dst),
                 r.char_count,
                 "是" if r.ocr_used else "",
+                r.img_count or "",
                 r.elapsed_ms,
                 r.message,
             ])
+def _process_embedded_images(
+    text: str, src: Path, base_dir: Path, out_dir: Path, stem: str,
+    use_split: bool, options: ConvertOptions,
+) -> tuple[str, int]:
+    """抽取 docx/pptx 内嵌图片：落盘真实文件 + 位置引用 + OCR 内联。
+
+    - docx: mammoth 输出 ![](data:xxx;base64,...)，就地替换（位置天然正确）
+    - pptx: markitdown 丢弃图片，从 pptx(zip) 的 ppt/media 按 slide rels 映射插回对应页
+
+    返回 (new_text, 抽取图片张数)。
+    """
+    if use_split:
+        IMG_DIR_HOLDER["dir"] = str(base_dir / "img")
+        rel_dir = "img"
+    else:
+        IMG_DIR_HOLDER["dir"] = str(out_dir / f"{stem}_img")
+        rel_dir = f"{stem}_img"
+    counter = [0]
+    if src.suffix.lower() == ".docx":
+        text = _docx_extract_images(text, src, rel_dir, options, counter)
+    elif src.suffix.lower() in (".pptx", ".ppt"):
+        text = _pptx_insert_slide_images(text, src, rel_dir, options, counter)
+
+    # 清理任何残留的 data URI 占位/截断位（防御性）
+    text = re.sub(r"^![^\n]*\(data:image/[a-zA-Z0-9+-]+;base64[^)]*\)\s*$", "", text, flags=re.M)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text, counter[0]
+
+
+def _pptx_insert_slide_images(text, src, rel_dir, options, counter):
+    """从 pptx 包内取每张幻灯片的图片，插到 markitdown 的 slide 标记之后"""
+    try:
+        raw = src.read_bytes()
+    except OSError:
+        return text
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        return text
+    names = set(z.namelist())
+
+    def _resolve(t):
+        return posixpath.normpath(posixpath.join("ppt/slides", t)).lstrip("/")
+
+    per_slide: dict[int, list[str]] = {}
+    for nm in sorted(names):
+        m = re.fullmatch(r"ppt/slides/slide(\d+)\.xml", nm)
+        if not m:
+            continue
+        sn = int(m.group(1))
+        rels_nm = f"ppt/slides/_rels/slide{sn}.xml.rels"
+        if rels_nm not in names:
+            continue
+        rels_xml = z.read(rels_nm).decode("utf-8", "ignore")
+        rid_map = dict(re.findall(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rels_xml))
+        slide_xml = z.read(f"ppt/slides/slide{sn}.xml").decode("utf-8", "ignore")
+        blocks: list[str] = []
+        for rid in dict.fromkeys(re.findall(r'r:(?:embed|link)="(rId\d+)"', slide_xml)):
+            target = rid_map.get(rid, "")
+            if "media/" not in target:  # hyperlink 等非图片关系
+                continue
+            path = _resolve(target)
+            if path not in names:
+                continue
+            data = z.read(path)
+            if len(data) < _MIN_IMAGE_BYTES:
+                continue
+            ext = Path(path).suffix or ".png"
+            name = f"s{sn}_{counter[0] + 1:02d}{ext}"
+            blk = _image_block(data, name, rel_dir, options, counter)
+            if blk:
+                blocks.append(blk)
+        if blocks:
+            per_slide[sn] = blocks
+
+    # 按 marker 切开（捕获组 => [前导, "1", 页1正文, "2", 页2正文, ...]），
+    # 在每页第一个非空行（标题）之后插入该页图片
+    parts = _SLIDE_MARKER.split(text)
+    if not parts or (len(parts) % 2 != 1):
+        return text
+    out = [parts[0]]
+    for i in range(1, len(parts) - 1, 2):
+        sn, page_body = int(parts[i]), parts[i + 1]
+        blocks = per_slide.get(sn)
+        if not blocks:
+            out.append(f"<!-- Slide number: {sn} -->\n" + page_body)
+            continue
+        lines = page_body.splitlines()
+        first = 0
+        while first < len(lines) and not lines[first].strip():
+            first += 1
+        insert_idx = (first + 1) if first < len(lines) else len(lines)
+        lines = lines[:insert_idx] + "\n\n".join(blocks).splitlines() + lines[insert_idx:]
+        out.append(f"<!-- Slide number: {sn} -->\n" + "\n".join(lines))
+    return "\n".join(out)
+
+
+def _docx_extract_images(text: str, src: Path, rel_dir: str,
+                         options, counter: list, extra_only: bool = False) -> str:
+    """docx 内嵌图片：直接读 docx.zip 的 word/media 抽取（替代 mammoth，修复截断/位置 bug）。"""
+    try:
+        raw = src.read_bytes()
+    except OSError:
+        return text
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        return text
+    names = set(z.namelist())
+    doc_xml, rels_xml = "word/document.xml", "word/_rels/document.xml.rels"
+    if doc_xml not in names or rels_xml not in names:
+        return text
+    rid_map: dict[str, str] = {}
+    for m in re.finditer(r'<Relationship\s+([^>]+)/?>',
+                         z.read(rels_xml).decode("utf-8", "ignore")):
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        rid_map[attrs.get("Id", "")] = attrs.get("Target", "")
+    xml = z.read(doc_xml).decode("utf-8", "ignore")
+    # 第一次：按 w:p 顺序扫，收集大图
+    ordered, para_pos = [], []
+    _gpara = 0
+    for pm in re.finditer(r'<w:p[ >](.*?)</w:p>', xml, re.S):
+        _gpara += 1
+        for rid in dict.fromkeys(re.findall(r'\br?:(?:embed|link)="(rId\d+)"', pm.group(1))):
+            target = rid_map.get(rid, "")
+            if not target or "media/" not in target:
+                continue
+            path = posixpath.normpath(posixpath.join("word", target)).lstrip("/")
+            if path not in names:
+                continue
+            data = z.read(path)
+            if len(data) < _MIN_IMAGE_BYTES:
+                continue
+            counter[0] += 1
+            ext = Path(path).suffix or ".png"
+            name = f"{counter[0]:02d}{ext}"
+            (Path(IMG_DIR_HOLDER["dir"]) / name).parent.mkdir(parents=True, exist_ok=True)
+            (Path(IMG_DIR_HOLDER["dir"]) / name).write_bytes(data)
+            ordered.append(name)
+            para_pos.append(_gpara)
+    if not ordered:
+        return text
+
+    def _block(i, alt):
+        name = ordered[i]
+        blk = f"![{alt}]({rel_dir}/{name})"
+        if options.enable_ocr and i + 1 <= _MAX_OCR_IMAGES:
+            ochr = _soft_ocr_image((Path(IMG_DIR_HOLDER["dir"]) / name).read_bytes(), name)
+            if ochr:
+                q = "\n".join("> " + ln for ln in ochr.splitlines() if ln.strip())
+                blk += f"\n\n> 图片{i + 1} OCR 内容\n{q}"
+        return blk
+
+    # extra_only 模式：只追加尚未在正文中出现的图片
+    if extra_only:
+        missing = [i for i, n in enumerate(ordered) if n not in text]
+        if not missing:
+            return text
+        parts = [_block(i, f"图片{i+1}") for i in missing]
+        return text.rstrip() + "\n\n" + "\n\n".join(parts)
+
+    # 判定：mammoth 是否保留了完整图片引用（无 alt 图 => 截断占位）
+    md_imgs = list(re.finditer(r"!\[[^\]]*\]\([^)]*base64[^)]*\)", text))
+    if len(md_imgs) == len(ordered):
+        # mammoth 有 alt 路径：in 有结构 ![](data:${base64<截断>})，按序替换
+        out = text
+        for i in reversed(range(len(ordered))):
+            m = md_imgs[i]
+            alt = re.match(r"!\[([^\]]*)]", m.group(0)).group(1).strip() or f"图片{i+1}"
+            out = out[:m.start()] + _block(i, alt) + out[m.end():]
+        return out
+
+    # 无 alt 图路径：按文档 w:p 顺序估算段落到 text 上的位置
+    # 分母：整个文档 w:p 数；分子：para_pos[i]
+    n_wp = len(re.findall(r"<w:p[ =>]", xml))
+    texts = text.split("\n\n")
+    for i in reversed(range(len(ordered))):
+        est = int(para_pos[i] * max(len(texts)-1, 1) / max(n_wp, 1))
+        texts[est] = (texts[est].rstrip() + "\n\n") + _block(i, f"图片{i+1}") if texts[est].strip() else _block(i, f"图片{i+1}")
+    return "\n".join(texts)
