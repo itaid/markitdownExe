@@ -5,6 +5,7 @@ markitdown[pdf,docx,pptx,xlsx]==0.1.7
 # numpy 必须 <2（rapidocr/torch 生态兼容），opencv 固定 4.x
 rapidocr_onnxruntime>=1.3,<2
 pypdfium2>=4.30
+Pillow>=10.0
 opencv-python-headless==4.10.0.84
 numpy>=1.24,<2
 

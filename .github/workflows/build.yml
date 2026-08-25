@@ -3,49 +3,74 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ["v*"]          # 打 tag（如 v0.2.0）→ 构建发布版
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
         description: "手动指定版本号（留空=latest）"
         required: false
         default: ""
+  pull_request:
 
-# 版本号优先级: 触发 tag > 手动输入 > latest
-env:
-  VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name
-               || github.event.inputs.tag
-               || 'latest' }}
-
+# 单测在任何 push（含 PR）时都会跑，不依赖 tag
 jobs:
   test:
     name: 转换核心测试 (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: |
           python -m pip install -e ".[gui,ocr]" pytest
           pytest -q
 
+  # 版本号优先级: 触发 tag > 手动输入 > latest
+  version:
+    name: 计算版本号
+    needs: test
+    if: github.event_name == 'push'   # PR 时跳过（PR 的 tag 上下文属于 fork，不可信）
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            v="${{ github.event.inputs.tag }}"
+            [[ "$v" != v* ]] && v="v$v"
+            echo "version=$v" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=latest" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
     name: 打包 Windows EXE
     runs-on: windows-latest
-    needs: test
+    needs: [test, version]
+    if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+        with:
+          # 打包必须取 tag 指向的代码（tag 推上去的那个 commit）
+          ref: ${{ startsWith(github.ref, 'refs/tags/') && github.ref || 'refs/heads/main' }}
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: 写入版本号
+      - name: 写入版本号（程序 __version__ + 产物名）
         shell: pwsh
         run: |
-          $ver = "${{ env.VERSION }}".TrimStart('v')
-          Add-Content -Path "src/doc2md_tool/__init__.py" -Value ""
-          (Get-Content "src/doc2md_tool/__init__.py") -replace '__version__ = "[^"]*"','__version__ = "' + $ver + '"') | Set-Content "src/doc2md_tool/__init__.py"
-          Write-Output "构建版本: v$ver"
+          $ver = "${{ needs.version.outputs.version }}".TrimStart('v')
+          $path = "src/doc2md_tool/__init__.py"
+          $lines = Get-Content $path
+          foreach ($i in 0..($lines.Count - 1)) {
+            if ($lines[$i] -like "__version__ = *") { $lines[$i] = '__version__ = "' + $ver + '"' }
+          }
+          Set-Content $path -Value $lines
+          Write-Output "Program version: $ver"
       - name: 安装依赖
         shell: pwsh
         run: |
@@ -57,11 +82,13 @@ jobs:
       - name: 压缩成品
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/doc2md -DestinationPath "dist/doc2md_${{ env.VERSION }}_win64.zip"
+          Compress-Archive -Path dist/doc2md -DestinationPath "dist/doc2md_${{ needs.version.outputs.version }}_win64.zip"
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: doc2md_${{ env.VERSION }}_win64
-          path: dist/doc2md_${{ env.VERSION }}_win64.zip
+          name: doc2md_${{ needs.version.outputs.version }}_win64
+          path: dist/doc2md_${{ needs.version.outputs.version }}_win64.zip
           if-no-files-found: error
           retention-days: 90
+          # 给拉引用保护用的密钥名（在仓库 Settings → Secrets 配置 ACTIONS_ARTIFACTS 后可取消注释）
+          # include-hidden-files: true
